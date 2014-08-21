@@ -50,10 +50,10 @@ public class MigrateCostEstimate {
         // init state values
         statePacksRDD.forEach((state, packsRDD) -> stateValues.put(state, new float[(int) packsRDD.count()]));
         int maxNumIteration = 60;
-        float diff = 0.0f;
         float threshold = 5.0f;
+        System.out.println("Start iteration");
         for (int i = 0; i < maxNumIteration; i++) {
-            System.out.println("Iteration " + i);
+            float diff = 0.0f;
             for (int state : states) {
 //                System.out.println("calc state " + state);
                 float[] newValues = computeNewValues(context, gamma, getTargetStates(state, migrationMetrics), state,
@@ -67,8 +67,7 @@ public class MigrateCostEstimate {
             if (diff < threshold) {
                 break;
             }
-            System.out.println(diff);
-            diff = 0.0f;
+            System.out.println("iteration " + i + ", with diff " + diff);
         }
         System.out.println("Writing out values");
         Path outDir = Paths.get(args[3]);
