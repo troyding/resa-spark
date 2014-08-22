@@ -1,9 +1,14 @@
 package com.ding.spark.migrate;
 
+import com.esotericsoftware.kryo.Kryo;
+import com.esotericsoftware.kryo.Serializer;
+import com.esotericsoftware.kryo.io.Input;
+import com.esotericsoftware.kryo.io.Output;
 import org.apache.spark.SparkConf;
 import org.apache.spark.api.java.JavaPairRDD;
 import org.apache.spark.api.java.JavaSparkContext;
 import org.apache.spark.broadcast.Broadcast;
+import org.apache.spark.serializer.KryoRegistrator;
 import org.apache.spark.storage.StorageLevel;
 import scala.Tuple2;
 
@@ -26,6 +31,7 @@ public class MigrateCostEstimate {
     public static void main(String[] args) throws IOException {
         SparkConf conf = new SparkConf();
         conf.set("spark.liveListenerBus.eventQueueCapacity", 1000000 + "");
+        conf.set("spark.kryo.registrator", MyKryoRegistrator.class.getName());
         JavaSparkContext context = new JavaSparkContext(conf);
         context.setCheckpointDir("/tmp/spark");
         float gamma = 0.9f;
@@ -41,40 +47,52 @@ public class MigrateCostEstimate {
                 .mapToInt(Integer::parseInt).sorted().toArray();
         // parse all states
         Map<Integer, JavaPairRDD<Integer, int[]>> statePacksRDD = createStateRDDs(args[2], context, states);
-        System.out.println("Finished statePacksRDD, states=" + statePacksRDD.keySet());
+        Map<Integer, Long> stateNumPacks = statePacksRDD.entrySet().stream().collect(Collectors.toMap(e -> e.getKey(),
+                e -> e.getValue().count()));
+        System.out.println("Finished statePacksRDD, states=" + stateNumPacks);
         // calc state pack costs first, avoid duplicated computation
         Map<String, JavaPairRDD<Long, Float>> costMap = createCostRDDs(dataSizes, totalDataSize, migrationMetrics,
-                statePacksRDD);
+                stateNumPacks, statePacksRDD);
         System.out.println("Finished costMap, migration=" + costMap.keySet());
-        Map<Integer, float[]> stateValues = new HashMap<>();
         // init state values
-        statePacksRDD.forEach((state, packsRDD) -> stateValues.put(state, new float[(int) packsRDD.count()]));
+        // values data is small, so broadcast it for performance consideration
+        Map<Integer, Broadcast<float[]>> stateValues = new HashMap<>();
+//        float initValue = (Float) context.union(costMap.values().toArray(new JavaPairRDD[costMap.size()])).values()
+//                .min((Comparator & Serializable) ((v1, v2) -> Float.compare((Float) v1, (Float) v2))) * 9;
+        float initValue = 0;
+        System.out.println("Init value is " + initValue);
+        stateNumPacks.forEach((state, numPacks) -> {
+            float[] initValues = new float[numPacks.intValue()];
+            Arrays.fill(initValues, initValue);
+            stateValues.put(state, context.broadcast(initValues));
+        });
         int maxNumIteration = 60;
         float threshold = 5.0f;
-        System.out.println("Start iteration");
+        System.out.println("Start iteration @ " + new Date());
         for (int i = 0; i < maxNumIteration; i++) {
             float diff = 0.0f;
             for (int state : states) {
-//                System.out.println("calc state " + state);
                 float[] newValues = computeNewValues(context, gamma, getTargetStates(state, migrationMetrics), state,
                         costMap, stateValues);
-                float[] oldValues = stateValues.put(state, newValues);
+                Broadcast<float[]> oldBroadcastedValues = stateValues.put(state, context.broadcast(newValues));
+                float[] oldValues = oldBroadcastedValues.getValue();
                 for (int j = 0; j < newValues.length; j++) {
                     diff += Math.abs(newValues[j] - oldValues[j]);
                 }
-//                System.out.println("finish state " + state);
+                oldBroadcastedValues.destroy(false);
             }
             if (diff < threshold) {
                 break;
             }
             System.out.println("iteration " + i + ", with diff " + diff);
         }
+        System.out.println("iteration end @ " + new Date());
         System.out.println("Writing out values");
         Path outDir = Paths.get(args[3]);
         if (!Files.exists(outDir)) {
             Files.createDirectories(outDir);
         }
-        stateValues.forEach((state, vaules) -> writeStateValue(outDir.resolve("values_" + state), vaules));
+        stateValues.forEach((state, vaules) -> writeStateValue(outDir.resolve("values_" + state), vaules.getValue()));
         System.out.println("Done");
     }
 
@@ -90,16 +108,13 @@ public class MigrateCostEstimate {
         }
     }
 
-
     private static float[] computeNewValues(JavaSparkContext context, float gamma, Map<Integer, Double> targetStates,
                                             int currState, Map<String, JavaPairRDD<Long, Float>> costMap,
-                                            Map<Integer, float[]> stateValues) {
+                                            Map<Integer, Broadcast<float[]>> stateValues) {
         List<JavaPairRDD<Integer, Float>> rdds = new ArrayList<>(targetStates.size());
-        List<Broadcast<float[]>> oldValues = new ArrayList<>(targetStates.size());
         targetStates.forEach((targetState, p) -> {
             boolean first = currState < targetState;
-            // values data is small, so broadcast it for performance consideration
-            Broadcast<float[]> values = context.broadcast(stateValues.get(targetState));
+            Broadcast<float[]> values = stateValues.get(targetState);
             JavaPairRDD<Long, Float> costRDD = costMap.get(makeCostKey(currState, targetState));
             if (costRDD == null) {
                 throw new IllegalStateException("Cannot find cost rdd for " + makeCostKey(currState, targetState));
@@ -109,7 +124,6 @@ public class MigrateCostEstimate {
                             (t._2() + values.getValue()[parsePackId(t._1(), !first)] * gamma) * p.floatValue()))
                     .reduceByKey((v1, v2) -> Math.min(v1, v2))
                     .persist(StorageLevel.MEMORY_AND_DISK_SER());
-            oldValues.add(values);
             rdds.add(rdd);
         });
         JavaPairRDD<Integer, Float> resultRDD = rdds.remove(0);
@@ -117,21 +131,16 @@ public class MigrateCostEstimate {
             resultRDD = context.union(resultRDD, rdds).reduceByKey((v1, v2) -> v1 + v2);
         }
         List<Float> tmpValues = resultRDD.sortByKey().values().collect();
-        int id = -1;
         float[] newValues = new float[tmpValues.size()];
         for (int j = 0; j < newValues.length; j++) {
-//            if (id >= tmpValues.get(j)._1()) {
-//                throw new IllegalStateException("id >= tmpValues.get(j)._1()");
-//            }
-//            id = tmpValues.get(j)._1();
             newValues[j] = tmpValues.get(j);
         }
-        oldValues.forEach(values -> values.destroy(true));
         return newValues;
     }
 
     private static Map<String, JavaPairRDD<Long, Float>> createCostRDDs(double[] dataSizes, double totalSize,
                                                                         SortedMap<String, Double> migrationMetrics,
+                                                                        Map<Integer, Long> stateNumPacks,
                                                                         Map<Integer, JavaPairRDD<Integer, int[]>> statePacksRDD) {
         Map<String, JavaPairRDD<Long, Float>> costMap = new HashMap<>();
         // cost from state 2 to state 3 is equals that from state 3 to state 2
@@ -142,9 +151,12 @@ public class MigrateCostEstimate {
                 .map(s -> new int[]{Integer.parseInt(s[0]), Integer.parseInt(s[1])})
                 .forEach(m -> costMap.computeIfAbsent(makeCostKey(m[0], m[1]), k -> {
                     KuhnMunkres km = new KuhnMunkres(dataSizes.length);
+                    long numRecords = stateNumPacks.get(m[0]) * stateNumPacks.get(m[1]);
+                    // one float and one long in kryo at least costs about 16 bytes
+                    int part = (int) (numRecords * 16L / (32L * 1024 * 1024));
                     JavaPairRDD<Long, Float> costRDD = statePacksRDD.get(m[0]).cartesian(statePacksRDD.get(m[1]))
                             .mapToPair(t -> stateCost(t._1(), t._2(), km, dataSizes, totalSize))
-                            .coalesce(64, true).persist(StorageLevel.DISK_ONLY());
+                            .coalesce(Math.max(64, part), true).persist(StorageLevel.MEMORY_AND_DISK_SER());
                     costRDD.checkpoint();
                     return costRDD;
                 }));
@@ -191,7 +203,8 @@ public class MigrateCostEstimate {
                                                  KuhnMunkres kmAlg, double[] dataSizes, double totalSize) {
         long id = from._1().longValue() << 32;
         id = id | to._1().longValue();
-        return new Tuple2<>(id, (float) totalSize - packGain(from._2(), to._2(), kmAlg, dataSizes));
+        return new IdCostPair(id, (float) totalSize - packGain(from._2(), to._2(), kmAlg, dataSizes));
+//        return new Tuple2<>(id, (float) totalSize - packGain(from._2(), to._2(), kmAlg, dataSizes));
     }
 
     private static float packGain(int[] p1, int[] p2, KuhnMunkres kmAlg, double[] dataSizes) {
@@ -250,6 +263,45 @@ public class MigrateCostEstimate {
             return "[" + start + "," + end + "]";
         }
 
+    }
+
+    private static class IdCostPair extends Tuple2<Long, Float> {
+
+        public IdCostPair(Long _1, Float _2) {
+            super(_1, _2);
+        }
+
+        @Override
+        public boolean canEqual(Object that) {
+            return that instanceof IdCostPair;
+        }
+
+        @Override
+        public boolean equals(Object that) {
+            IdCostPair obj = (IdCostPair) that;
+            return _1().equals(obj._1()) && _2().equals(obj._2());
+        }
+    }
+
+    private static class IdCostPairSerializer extends Serializer<IdCostPair> {
+
+        @Override
+        public void write(Kryo kryo, Output output, IdCostPair object) {
+            output.writeLong(object._1());
+            output.writeFloat(object._2());
+        }
+
+        @Override
+        public IdCostPair read(Kryo kryo, Input input, Class<IdCostPair> type) {
+            return new IdCostPair(input.readLong(), input.readFloat());
+        }
+    }
+
+    public static class MyKryoRegistrator implements KryoRegistrator {
+        @Override
+        public void registerClasses(Kryo kryo) {
+            kryo.register(IdCostPair.class, new IdCostPairSerializer());
+        }
     }
 
     private static int[] parse(String s, String regex) {
